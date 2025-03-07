@@ -32,154 +32,97 @@ const safeFirestoreOperation = async <T>(operation: () => Promise<T>, fallback: 
   }
 };
 
-export const loadChatsFromStorage = async (userId?: string, onUpdate?: (chats: Chat[]) => void): Promise<any> => {
-  // For guest users or if there's an error, use local storage
-  const loadFromLocalStorage = (): Chat[] => {
-    try {
-      const storedChats = localStorage.getItem('guest_chats');
-      if (storedChats) {
-        const parsedChats = JSON.parse(storedChats);
-        return parsedChats.length > 0 ? parsedChats : [DEFAULT_CHAT];
-      }
-    } catch (error) {
-      console.error('Error loading from local storage:', error);
-    }
-    return [DEFAULT_CHAT];
-  };
 
-  // If no user ID, just load from local storage
-  if (!userId) {
-    return loadFromLocalStorage();
+export const loadFromLocalStorage = (): Chat[] => {
+  try {
+    const storedChats = localStorage.getItem('guest_chats');
+    if (storedChats) {
+      const parsedChats = JSON.parse(storedChats);
+      return parsedChats.length ? parsedChats : [DEFAULT_CHAT];
+    }
+  } catch (error) {
+    console.error('Local storage error:', error);
   }
+  return [DEFAULT_CHAT];
+};
+export const loadChatsFromStorage = async (userId?: string, onUpdate?: (chats: Chat[]) => void) => {
+  if (!userId) return loadFromLocalStorage();
 
   try {
-    console.log('Loading chats for user:', userId);
+    // Ensure user document exists
+    const userDocRef = doc(db, 'users', userId);
+    const userDoc = await getDoc(userDocRef);
     
-    // Ensure the user document exists
-    try {
-      const userDocRef = doc(db, 'users', userId);
-      const userDoc = await getDoc(userDocRef);
-      
-      if (!userDoc.exists()) {
-        await setDoc(userDocRef, { 
-          lastActive: serverTimestamp(),
-          createdAt: serverTimestamp()
-        });
-      } else {
-        await setDoc(userDocRef, { 
-          lastActive: serverTimestamp() 
-        }, { merge: true });
-      }
-    } catch (error) {
-      console.error('Error ensuring user document exists:', error);
-      // Continue even if this fails
+    if (!userDoc.exists()) {
+      await setDoc(userDocRef, { 
+        createdAt: serverTimestamp(),
+        lastActive: serverTimestamp()
+      });
+    } else {
+      await setDoc(userDocRef, { lastActive: serverTimestamp() }, { merge: true });
     }
-    
-    // Set up real-time listener if onUpdate is provided
+
+    // Real-time listener
     if (onUpdate) {
-      try {
-        const chatsRef = collection(db, 'users', userId, 'chats');
-        const q = query(
-          chatsRef,
-          where('deleted', '!=', true),
-          orderBy('deleted', 'asc'),
-          orderBy('createdAt', 'desc')
-        );
-        
-        const unsubscribe = onSnapshot(q, 
-          (snapshot) => {
-            const chats = snapshot.docs.map(doc => ({
-              id: doc.id,
-              name: doc.data().name || 'New Chat',
-              messages: doc.data().messages || [],
-              createdAt: doc.data().createdAt?.toDate() || new Date()
-            }));
-            
-            if (chats.length > 0) {
-              onUpdate(chats);
-            } else {
-              // Create a default chat if no chats exist
-              createDefaultChat(userId).then(defaultChat => {
-                onUpdate([defaultChat]);
-              }).catch(error => {
-                console.error('Error creating default chat:', error);
-                onUpdate([{ ...DEFAULT_CHAT, id: crypto.randomUUID() }]);
-              });
-            }
-          },
-          (error) => {
-            console.error('Error in chat listener:', error);
-            // Fall back to local storage on error
-            onUpdate(loadFromLocalStorage());
-          }
-        );
-        
-        return unsubscribe;
-      } catch (error) {
-        console.error('Error setting up chat listener:', error);
-        // Fall back to local storage on error
-        onUpdate(loadFromLocalStorage());
-        return () => {}; // Return empty function as unsubscribe
-      }
-    }
-    
-    // If no onUpdate provided, load chats once
-    try {
       const chatsRef = collection(db, 'users', userId, 'chats');
-      const q = query(
-        chatsRef,
-        where('deleted', '!=', true),
-        orderBy('deleted', 'asc'),
+      const q = query(chatsRef, 
+        where('deleted', '==', false),
         orderBy('createdAt', 'desc')
       );
       
-      const querySnapshot = await getDocs(q);
-      
-      if (querySnapshot.empty) {
-        // Create a default chat for new users
-        const defaultChat = await createDefaultChat(userId);
-        return [defaultChat];
-      }
-      
-      const chats = querySnapshot.docs.map(doc => ({
-        id: doc.id,
-        name: doc.data().name || 'New Chat',
-        messages: doc.data().messages || [],
-        createdAt: doc.data().createdAt?.toDate() || new Date()
-      }));
-      
-      return chats;
-    } catch (error) {
-      console.error('Error loading chats from Firestore:', error);
-      return loadFromLocalStorage();
+      return onSnapshot(q, 
+        (snapshot) => {
+          const chats = snapshot.docs.map(doc => ({
+            id: doc.id,
+            ...doc.data()
+          }));
+          onUpdate(chats.length ? chats : [DEFAULT_CHAT]);
+        },
+        (error) => {
+          console.error('Listener error:', error);
+          onUpdate(loadFromLocalStorage());
+        }
+      );
     }
+
+    // One-time fetch
+    const chatsRef = collection(db, 'users', userId, 'chats');
+    const q = query(chatsRef, 
+      where('deleted', '==', false),
+      orderBy('createdAt', 'desc')
+    );
+    
+    const querySnapshot = await getDocs(q);
+    
+    if (querySnapshot.empty) {
+      return [await createDefaultChat(userId)];
+    }
+
+    return querySnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+
   } catch (error) {
-    console.error('Error loading chats:', error);
+    console.error('Failed to load chats:', error);
     return loadFromLocalStorage();
   }
 };
 
-// Helper function to create a default chat
-const createDefaultChat = async (userId: string): Promise<Chat> => {
-  const defaultChatId = crypto.randomUUID();
-  const defaultChat = { ...DEFAULT_CHAT, id: defaultChatId };
+const createDefaultChat = async (userId: string) => {
+  const defaultChat = {
+    ...DEFAULT_CHAT,
+    createdAt: serverTimestamp(),
+    deleted: false // Explicitly set
+  };
   
-  try {
-    const newChatRef = doc(db, 'users', userId, 'chats', defaultChatId);
-    await setDoc(newChatRef, {
-      name: 'New Chat',
-      messages: [],
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-      deleted: false
-    });
-    return defaultChat;
-  } catch (error) {
-    console.error('Error creating default chat:', error);
-    return defaultChat; // Return the chat object even if saving to Firebase failed
-  }
+  const docRef = await addDoc(
+    collection(db, 'users', userId, 'chats'),
+    defaultChat
+  );
+  
+  return { ...defaultChat, id: docRef.id };
 };
-
 export const saveChatsToStorage = async (chats: Chat[], userId?: string) => {
   // Always save to local storage as a backup
   try {
