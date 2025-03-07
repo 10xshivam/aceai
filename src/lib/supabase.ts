@@ -1,0 +1,1 @@
+// Removing Supabase configuration
